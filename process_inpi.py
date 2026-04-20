@@ -2,40 +2,23 @@
 """
 Processeur de données INPI/BCE pour l'outil de benchmark sectoriel.
 
-Télécharge le jeu de données officiel depuis data.gouv.fr, le filtre aux
-ratios utiles à l'outil, ne conserve que l'année la plus récente par
-(NAF, tranche CA, ratio), et produit un JSON compact.
+Télécharge le jeu de données officiel depuis data.gouv.fr, en extrait les
+ratios utiles à l'outil (parmi les 95 colonnes disponibles), ne conserve
+que l'année la plus récente par (NAF, tranche CA), et produit un JSON
+compact.
+
+Le CSV source est au format "large" :
+    classe_naf ; classe_ca ; exercice ; <ratio>_q10 ; <ratio>_q25 ; ...
 
 Usage :
-    python3 process_inpi.py [--output benchmark_inpi.json]
-
-Le JSON produit a cette structure :
-{
-  "_meta": {
-    "source": "INPI/BCE via data.gouv.fr",
-    "generated_at": "2026-04-18T14:00:00Z",
-    "naf_count": 732,
-    "unmapped_ratios": ["rotation_stocks_jours", ...]
-  },
-  "naf": {
-    "5610A": {
-      "label": "Restauration traditionnelle",
-      "tranches": {
-        "0-250k": { "margeBrute": {"q10": 55, "q25": 62, ...}, ... },
-        "250k-500k": { ... }
-      }
-    }
-  }
-}
+    python3 process_inpi.py [--output benchmark_inpi.json] [--pretty]
 """
 
 import argparse
 import csv
 import io
 import json
-import re
 import sys
-import unicodedata
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,245 +27,186 @@ from urllib.request import urlopen, Request
 DATA_URL = "https://www.data.gouv.fr/api/1/datasets/r/1222d433-267f-45ea-88bc-43b372d882c7"
 
 # ---------------------------------------------------------------------------
-# Mapping des noms de ratios INPI/BCE vers les identifiants internes de l'outil
+# Mapping direct préfixe_colonne CSV → ratio interne de l'outil
 # ---------------------------------------------------------------------------
-# Chaque clé cible (ex. "margeBrute") a une liste de patterns candidats.
-# Le matching est insensible à la casse, aux accents et aux séparateurs.
-RATIO_MAP = {
-    "margeBrute": [
-        "taux_marge_commerciale", "taux de marge commerciale",
-        "marge commerciale",
-    ],
-    "tauxVA": [
-        "taux_valeur_ajoutee", "taux de valeur ajoutee",
-        "tx_va", "valeur ajoutee",
-    ],
-    "tauxEBE": [
-        "taux_marge_brute_exploitation", "taux_ebe", "tx_ebe",
-        "taux ebe", "marge brute d exploitation",
-    ],
-    "rentaExpl": [
-        "rentabilite_economique", "rentabilite exploitation",
-        "rentabilite d exploitation",
-    ],
-    "netCA": [
-        "rentabilite_nette", "taux de rentabilite nette",
-        "resultat_net_ca", "resultat net sur ca",
-    ],
-    "dso": [
-        "credit_client", "credit client", "delai_client",
-        "delai clients", "dso",
-    ],
-    "dpo": [
-        "credit_fournisseur", "credit fournisseur", "delai_fournisseur",
-        "delai fournisseurs", "dpo",
-    ],
-    "bfrJours": [
-        "besoin_fonds_roulement", "bfr",
-        "besoin en fonds de roulement",
-    ],
-    "persoVA": [
-        "poids_charges_personnel_va",
-        "charges de personnel sur va",
-    ],
-    "persoCA": [
-        "poids_charges_personnel",
-        "charges de personnel sur ca",
-    ],
+# Une ligne du CSV = une cohorte (NAF, tranche, année)
+# Chaque ratio occupe 5 colonnes (q10, q25, q50, q75, q90)
+RATIO_COLUMNS = {
+    "margeBrute": "part_ca_marge_brute",       # % du CA — proxy marge brute
+    "tauxEBE": "part_ca_ebe",                  # EBE / CA
+    "rentaExpl": "part_ca_ebit",               # EBIT / CA ≈ rentabilité exploitation
+    "netCA": "part_ca_resultat_net",           # Résultat net / CA
+    "bfrJours": "poids_bfr_exploitation_sur_ca_jours",  # BFR en jours de CA
+    "dso": "credit_clients_jours",             # Délai règlement clients
+    "dpo": "credit_fournisseurs_jours",        # Délai règlement fournisseurs
+    # Ratios non disponibles dans ce dataset :
+    # - tauxVA (taux de valeur ajoutée)
+    # - persoVA (charges de personnel / VA)
+    # - persoCA (charges de personnel / CA)
+    # Ils peuvent être ajoutés manuellement via l'interface de l'outil
+    # pour certains secteurs clés (via Banque de France par exemple).
 }
 
-
-def normalize(s: str) -> str:
-    """Normalise une chaîne : minuscules, sans accent, séparateurs unifiés."""
-    if s is None:
-        return ""
-    s = str(s).lower()
-    s = unicodedata.normalize("NFD", s)
-    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
-    s = re.sub(r"[_\s\-']+", " ", s).strip()
-    return s
-
-
-def build_matcher():
-    """Construit un matcher : nom_ratio_inpi -> id_interne."""
-    index = {}
-    for target, patterns in RATIO_MAP.items():
-        for p in patterns:
-            index[normalize(p)] = target
-    return index
-
-
-def match_ratio(name: str, matcher: dict):
-    """Tente de retrouver l'id interne à partir d'un nom de ratio INPI."""
-    n = normalize(name)
-    if not n:
-        return None
-    if n in matcher:
-        return matcher[n]
-    # Fallback : match par inclusion
-    for pattern, target in matcher.items():
-        if pattern in n or n in pattern:
-            return target
-    return None
+PERCENTILES = ["q10", "q25", "q50", "q75", "q90"]
 
 
 def download_csv(url: str) -> str:
     """Télécharge le CSV et retourne son contenu en texte UTF-8."""
     print(f"→ Téléchargement depuis {url}", file=sys.stderr)
     req = Request(url, headers={"User-Agent": "benchmark-fec/1.0"})
-    with urlopen(req, timeout=120) as resp:
+    with urlopen(req, timeout=180) as resp:
         data = resp.read()
     text = data.decode("utf-8", errors="replace")
-    print(f"  {len(data):,} octets reçus ({len(text.splitlines()):,} lignes)",
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    print(f"  {len(data):,} octets reçus ({text.count(chr(10)):,} lignes)",
           file=sys.stderr)
     return text
 
 
 def detect_separator(first_line: str) -> str:
     """Détecte le séparateur CSV (tab, pipe, point-virgule, virgule)."""
-    for sep in ["\t", "|", ";"]:
+    for sep in [";", "\t", "|"]:
         if sep in first_line:
             return sep
     return ","
 
 
-def parse_rows(csv_text: str):
-    """Parse le CSV et yield des dictionnaires ligne par ligne."""
-    # Normaliser les fins de ligne pour éviter l'erreur
-    # "new-line character seen in unquoted field"
-    csv_text = csv_text.replace("\r\n", "\n").replace("\r", "\n")
+def parse_num(v):
+    """Parse un nombre (gère virgule et point). Retourne None si invalide."""
+    if v is None:
+        return None
+    s = str(v).strip()
+    if s == "" or s.lower() in ("nan", "null", "na"):
+        return None
+    try:
+        return float(s.replace(",", "."))
+    except (ValueError, TypeError):
+        return None
+
+
+def process_dataset(csv_text: str, verbose: bool = True):
+    """Traite le CSV et retourne la structure compactée."""
     if not csv_text:
-        return
+        return {"_meta": {}, "naf": {}}
+
     first_line = csv_text.split("\n", 1)[0]
     sep = detect_separator(first_line)
-    reader = csv.DictReader(
-        io.StringIO(csv_text, newline=""),
-        delimiter=sep,
-    )
-    for row in reader:
-        yield row
+    if verbose:
+        print(f"→ Séparateur détecté : {sep!r}", file=sys.stderr)
 
+    reader = csv.DictReader(io.StringIO(csv_text, newline=""), delimiter=sep)
+    fields = reader.fieldnames or []
+    fields = [f.lstrip("\ufeff") if isinstance(f, str) else f for f in fields]
+    # Retire le BOM aussi du fieldnames original pour que row.get() fonctionne
+    clean_fields = {}
+    for orig in reader.fieldnames or []:
+        clean = orig.lstrip("\ufeff") if isinstance(orig, str) else orig
+        clean_fields[clean] = orig
 
-def process_dataset(csv_text: str, debug: bool = False):
-    """Traite le CSV et retourne la structure compactée."""
-    matcher = build_matcher()
+    def find_key(candidates):
+        for c in candidates:
+            if c in clean_fields:
+                return clean_fields[c]
+        for clean_name, orig_name in clean_fields.items():
+            if clean_name.lower() == c.lower():
+                return orig_name
+        return None
 
-    # Debug: afficher l'en-tête et quelques lignes
-    first_lines = csv_text.split("\n", 5)
-    if debug or True:  # Toujours logger l'en-tête pour diagnostiquer
-        print(f"\n--- DEBUG: première ligne (en-tête) ---", file=sys.stderr)
-        if first_lines:
-            print(f"  {first_lines[0][:500]}", file=sys.stderr)
-        print(f"--- Séparateur détecté: {repr(detect_separator(first_lines[0] if first_lines else ''))} ---",
+    naf_col = find_key(["classe_naf", "code_naf", "code_activite", "naf"])
+    tranche_col = find_key(["classe_ca", "tranche_ca",
+                            "tranche_chiffre_affaires", "tranche"])
+    annee_col = find_key(["exercice", "annee_exercice", "annee", "year"])
+
+    if not (naf_col and tranche_col and annee_col):
+        raise RuntimeError(
+            f"Colonnes structurantes manquantes. "
+            f"naf={naf_col!r}, tranche={tranche_col!r}, exercice={annee_col!r}."
+        )
+    if verbose:
+        print(f"→ Colonnes structurantes : naf={naf_col!r}, "
+              f"tranche={tranche_col!r}, exercice={annee_col!r}",
               file=sys.stderr)
-        # Afficher une ligne de données
-        if len(first_lines) > 1:
-            print(f"--- Exemple de ligne 2 ---", file=sys.stderr)
-            print(f"  {first_lines[1][:500]}", file=sys.stderr)
-        print("", file=sys.stderr)
 
-    # (naf, tranche, ratio) -> (year, values, label_naf)
+    # Vérifie la présence des colonnes de ratios attendues
+    available_ratios = {}
+    missing = []
+    for internal_id, prefix in RATIO_COLUMNS.items():
+        cols = {p: f"{prefix}_{p}" for p in PERCENTILES}
+        # Cherche dans clean_fields (sans BOM) et récupère le nom original
+        resolved = {}
+        all_found = True
+        for p, col_name in cols.items():
+            if col_name in clean_fields:
+                resolved[p] = clean_fields[col_name]
+            else:
+                all_found = False
+                break
+        if all_found:
+            available_ratios[internal_id] = resolved
+        else:
+            missing.append((internal_id, prefix))
+
+    if verbose:
+        print(f"→ Ratios mappés : {len(available_ratios)}/{len(RATIO_COLUMNS)}",
+              file=sys.stderr)
+        for internal_id in available_ratios:
+            print(f"    ✓ {internal_id} ← {RATIO_COLUMNS[internal_id]}_*",
+                  file=sys.stderr)
+        for internal_id, prefix in missing:
+            print(f"    ✗ {internal_id} ← {prefix}_* (colonnes manquantes)",
+                  file=sys.stderr)
+
+    if not available_ratios:
+        raise RuntimeError("Aucun ratio mappé. Vérifiez la structure du CSV.")
+
+    # (naf, tranche) -> {"year": int, "ratios": {internal_id: {q10..q90}}}
     bucket = {}
-    unmapped_counter = defaultdict(int)
-    naf_labels = {}
     row_count = 0
-    first_row_keys = None
-    first_row_sample = None
 
-    for row in parse_rows(csv_text):
+    for row in reader:
         row_count += 1
-        if first_row_keys is None:
-            first_row_keys = list(row.keys())
-            first_row_sample = dict(row)
-            print(f"--- Colonnes CSV trouvées ---", file=sys.stderr)
-            for k in first_row_keys:
-                print(f"  {k!r}", file=sys.stderr)
-            print(f"--- Exemple de première ligne ---", file=sys.stderr)
-            for k, v in list(first_row_sample.items())[:15]:
-                print(f"  {k} = {v!r}", file=sys.stderr)
-            print("", file=sys.stderr)
-
-        # Les noms de colonnes peuvent varier selon l'export
-        naf = (row.get("code_activite") or row.get("code_naf")
-               or row.get("naf") or row.get("code_ape")
-               or row.get("activite") or "").strip()
-        ratio_name = (row.get("nom_ratio") or row.get("ratio")
-                      or row.get("indicateur")
-                      or row.get("libelle_ratio")
-                      or row.get("nom_indicateur") or "").strip()
-        tranche = (row.get("tranche_chiffre_affaires")
-                   or row.get("tranche_ca")
-                   or row.get("tranche_ca_bucket")
-                   or row.get("tranche") or "tous").strip()
-        year_raw = (row.get("annee_exercice") or row.get("annee")
-                    or row.get("exercice")
-                    or row.get("year") or "0").strip()
-        naf_label = (row.get("libelle_activite")
-                     or row.get("libelle_naf")
-                     or row.get("libelle_ape") or "").strip()
-
-        if not naf or not ratio_name:
+        naf = (row.get(naf_col) or "").strip()
+        tranche = (row.get(tranche_col) or "tous").strip()
+        year_raw = (row.get(annee_col) or "0").strip()
+        if not naf:
             continue
-
         try:
             year = int(float(year_raw))
         except (ValueError, TypeError):
             year = 0
 
-        mapped = match_ratio(ratio_name, matcher)
-        if not mapped:
-            unmapped_counter[ratio_name] += 1
+        ratios_values = {}
+        for internal_id, cols in available_ratios.items():
+            values = {p: parse_num(row.get(cols[p])) for p in PERCENTILES}
+            if values["q50"] is not None:
+                ratios_values[internal_id] = values
+
+        if not ratios_values:
             continue
 
-        def parse_num(v):
-            if v is None or v == "":
-                return None
-            try:
-                return float(str(v).replace(",", "."))
-            except (ValueError, TypeError):
-                return None
-
-        values = {
-            "q10": parse_num(row.get("q10")),
-            "q25": parse_num(row.get("q25")),
-            "q50": parse_num(row.get("q50")),
-            "q75": parse_num(row.get("q75")),
-            "q90": parse_num(row.get("q90")),
-        }
-        # Skip si pas de médiane
-        if values["q50"] is None:
-            continue
-
-        key = (naf, tranche, mapped)
+        key = (naf, tranche)
         if key not in bucket or bucket[key]["year"] < year:
-            bucket[key] = {"year": year, "values": values}
+            bucket[key] = {"year": year, "ratios": ratios_values}
 
-        if naf_label and naf not in naf_labels:
-            naf_labels[naf] = naf_label
-
-    print(f"  {row_count:,} lignes traitées", file=sys.stderr)
-    print(f"  {len(bucket):,} combinaisons (NAF, tranche, ratio) retenues",
-          file=sys.stderr)
-    if unmapped_counter:
-        total_unmapped = sum(unmapped_counter.values())
-        print(f"  {total_unmapped:,} lignes ignorées (ratios non mappés) : "
-              f"{len(unmapped_counter)} libellés distincts", file=sys.stderr)
+    if verbose:
+        print(f"→ {row_count:,} lignes CSV traitées", file=sys.stderr)
+        print(f"→ {len(bucket):,} combinaisons (NAF, tranche) retenues "
+              f"(année la plus récente)", file=sys.stderr)
 
     # Regroupement final par NAF > tranche > ratio
-    by_naf = defaultdict(lambda: {"label": "", "tranches": defaultdict(dict)})
-    for (naf, tranche, ratio), item in bucket.items():
-        by_naf[naf]["tranches"][tranche][ratio] = item["values"]
-        if naf in naf_labels:
-            by_naf[naf]["label"] = naf_labels[naf]
+    by_naf = defaultdict(lambda: {"label": "", "tranches": {}})
+    for (naf, tranche), item in bucket.items():
+        by_naf[naf]["label"] = naf
+        by_naf[naf]["tranches"][tranche] = item["ratios"]
 
-    # Conversion defaultdict -> dict pour la sérialisation JSON
     result_naf = {
-        naf: {
-            "label": data["label"] or naf,
-            "tranches": dict(data["tranches"]),
-        }
+        naf: {"label": data["label"], "tranches": dict(data["tranches"])}
         for naf, data in sorted(by_naf.items())
     }
+
+    mapping_info = {k: RATIO_COLUMNS[k] for k in available_ratios}
 
     return {
         "_meta": {
@@ -291,12 +215,10 @@ def process_dataset(csv_text: str, debug: bool = False):
             "generated_at": datetime.now(timezone.utc)
                 .strftime("%Y-%m-%dT%H:%M:%SZ"),
             "naf_count": len(result_naf),
-            "mappings": {k: v for k, v in
-                         sorted(RATIO_MAP.items())},
-            "top_unmapped_ratios": sorted(
-                unmapped_counter.items(),
-                key=lambda x: -x[1]
-            )[:20],
+            "total_cohortes": len(bucket),
+            "rows_processed": row_count,
+            "ratio_mapping": mapping_info,
+            "ratios_not_in_dataset": ["tauxVA", "persoVA", "persoCA"],
         },
         "naf": result_naf,
     }
@@ -310,6 +232,8 @@ def main():
                     help="Fichier CSV local (si absent, télécharge depuis data.gouv.fr)")
     ap.add_argument("--pretty", action="store_true",
                     help="JSON indenté (plus gros fichier)")
+    ap.add_argument("--quiet", action="store_true",
+                    help="Supprime les logs détaillés")
     args = ap.parse_args()
 
     if args.input:
@@ -319,7 +243,7 @@ def main():
         csv_text = download_csv(DATA_URL)
 
     print("→ Traitement...", file=sys.stderr)
-    result = process_dataset(csv_text)
+    result = process_dataset(csv_text, verbose=not args.quiet)
 
     output_path = Path(args.output)
     with output_path.open("w", encoding="utf-8") as f:
@@ -330,14 +254,9 @@ def main():
 
     size_kb = output_path.stat().st_size / 1024
     print(f"✓ {output_path} généré ({size_kb:,.0f} Ko, "
-          f"{result['_meta']['naf_count']:,} codes NAF)", file=sys.stderr)
-
-    if result["_meta"]["top_unmapped_ratios"]:
-        print("\nRatios INPI non mappés (top 10) :", file=sys.stderr)
-        for name, count in result["_meta"]["top_unmapped_ratios"][:10]:
-            print(f"  {count:>6,}  {name}", file=sys.stderr)
-        print("\nPour mapper un ratio manquant, édite le dict RATIO_MAP "
-              "en haut du script.", file=sys.stderr)
+          f"{result['_meta']['naf_count']:,} codes NAF, "
+          f"{result['_meta'].get('total_cohortes', 0):,} cohortes)",
+          file=sys.stderr)
 
 
 if __name__ == "__main__":

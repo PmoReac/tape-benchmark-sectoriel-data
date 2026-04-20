@@ -163,31 +163,63 @@ def parse_rows(csv_text: str):
         yield row
 
 
-def process_dataset(csv_text: str):
+def process_dataset(csv_text: str, debug: bool = False):
     """Traite le CSV et retourne la structure compactée."""
     matcher = build_matcher()
+
+    # Debug: afficher l'en-tête et quelques lignes
+    first_lines = csv_text.split("\n", 5)
+    if debug or True:  # Toujours logger l'en-tête pour diagnostiquer
+        print(f"\n--- DEBUG: première ligne (en-tête) ---", file=sys.stderr)
+        if first_lines:
+            print(f"  {first_lines[0][:500]}", file=sys.stderr)
+        print(f"--- Séparateur détecté: {repr(detect_separator(first_lines[0] if first_lines else ''))} ---",
+              file=sys.stderr)
+        # Afficher une ligne de données
+        if len(first_lines) > 1:
+            print(f"--- Exemple de ligne 2 ---", file=sys.stderr)
+            print(f"  {first_lines[1][:500]}", file=sys.stderr)
+        print("", file=sys.stderr)
 
     # (naf, tranche, ratio) -> (year, values, label_naf)
     bucket = {}
     unmapped_counter = defaultdict(int)
     naf_labels = {}
     row_count = 0
+    first_row_keys = None
+    first_row_sample = None
 
     for row in parse_rows(csv_text):
         row_count += 1
+        if first_row_keys is None:
+            first_row_keys = list(row.keys())
+            first_row_sample = dict(row)
+            print(f"--- Colonnes CSV trouvées ---", file=sys.stderr)
+            for k in first_row_keys:
+                print(f"  {k!r}", file=sys.stderr)
+            print(f"--- Exemple de première ligne ---", file=sys.stderr)
+            for k, v in list(first_row_sample.items())[:15]:
+                print(f"  {k} = {v!r}", file=sys.stderr)
+            print("", file=sys.stderr)
+
         # Les noms de colonnes peuvent varier selon l'export
         naf = (row.get("code_activite") or row.get("code_naf")
-               or row.get("naf") or "").strip()
+               or row.get("naf") or row.get("code_ape")
+               or row.get("activite") or "").strip()
         ratio_name = (row.get("nom_ratio") or row.get("ratio")
                       or row.get("indicateur")
-                      or row.get("libelle_ratio") or "").strip()
+                      or row.get("libelle_ratio")
+                      or row.get("nom_indicateur") or "").strip()
         tranche = (row.get("tranche_chiffre_affaires")
                    or row.get("tranche_ca")
+                   or row.get("tranche_ca_bucket")
                    or row.get("tranche") or "tous").strip()
         year_raw = (row.get("annee_exercice") or row.get("annee")
-                    or row.get("exercice") or "0").strip()
+                    or row.get("exercice")
+                    or row.get("year") or "0").strip()
         naf_label = (row.get("libelle_activite")
-                     or row.get("libelle_naf") or "").strip()
+                     or row.get("libelle_naf")
+                     or row.get("libelle_ape") or "").strip()
 
         if not naf or not ratio_name:
             continue

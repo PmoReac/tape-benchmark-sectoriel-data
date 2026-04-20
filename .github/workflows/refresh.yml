@@ -1,0 +1,42 @@
+name: Refresh INPI/BCE benchmark data
+
+# Lance automatiquement le rafraîchissement :
+# - le 1er de chaque mois à 03:00 UTC
+# - à la demande via l'onglet Actions de GitHub
+on:
+  schedule:
+    - cron: '0 3 1 * *'
+  workflow_dispatch:
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout du repo
+        uses: actions/checkout@v4
+
+      - name: Installation de Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Génération du JSON
+        run: |
+          python3 process_inpi.py --output benchmark_inpi.json
+          ls -lh benchmark_inpi.json
+
+      - name: Commit si changement
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add benchmark_inpi.json
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: refresh INPI/BCE data ($(date -u +%Y-%m-%d))"
+            git push
+            echo "JSON mis à jour et committé"
+          else
+            echo "Aucun changement détecté, pas de commit"
+          fi

@@ -148,11 +148,17 @@ def detect_separator(first_line: str) -> str:
 
 def parse_rows(csv_text: str):
     """Parse le CSV et yield des dictionnaires ligne par ligne."""
-    lines = csv_text.splitlines()
-    if not lines:
+    # Normaliser les fins de ligne pour éviter l'erreur
+    # "new-line character seen in unquoted field"
+    csv_text = csv_text.replace("\r\n", "\n").replace("\r", "\n")
+    if not csv_text:
         return
-    sep = detect_separator(lines[0])
-    reader = csv.DictReader(io.StringIO(csv_text), delimiter=sep)
+    first_line = csv_text.split("\n", 1)[0]
+    sep = detect_separator(first_line)
+    reader = csv.DictReader(
+        io.StringIO(csv_text, newline=""),
+        delimiter=sep,
+    )
     for row in reader:
         yield row
 
